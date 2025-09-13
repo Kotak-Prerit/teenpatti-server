@@ -8,10 +8,26 @@ require('dotenv').config({ path: './config/.env' });
 const app = express();
 const server = http.createServer(app);
 
+// Production-ready origin list
+const allowedOrigins = [
+  "http://localhost:5173", 
+  "http://localhost:3000", 
+  "http://127.0.0.1:5173", 
+  "http://localhost:8080", 
+  "http://127.0.0.1:8080",
+  "https://nightstay.vercel.app",
+  "https://teenpatti-server.onrender.com"
+];
+
+// Add any additional origins from environment variable
+if (process.env.FRONTEND_URL) {
+  allowedOrigins.push(process.env.FRONTEND_URL);
+}
+
 // Socket.IO setup with CORS
 const io = socketIo(server, {
   cors: {
-    origin: ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://localhost:8080", "http://127.0.0.1:8080"],
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -23,7 +39,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // CORS middleware
 app.use(cors({
-  origin: ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://localhost:8080", "http://127.0.0.1:8080"],
+  origin: allowedOrigins,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true
 }));
