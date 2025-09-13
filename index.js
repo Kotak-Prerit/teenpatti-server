@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 require('dotenv').config({ path: './config/.env' });
 
 const app = express();
@@ -43,6 +44,47 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true
 }));
+
+// JWT Helper Functions
+const generateToken = (user) => {
+  return jwt.sign(
+    { 
+      id: user._id, 
+      name: user.name,
+      balance: user.balance 
+    },
+    process.env.JWT_KEY,
+    { expiresIn: process.env.JWT_EXPIRY || '7d' }
+  );
+};
+
+const verifyToken = (token) => {
+  return jwt.verify(token, process.env.JWT_KEY);
+};
+
+// JWT Authentication Middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: 'Access token required'
+    });
+  }
+
+  try {
+    const decoded = verifyToken(token);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(403).json({
+      success: false,
+      message: 'Invalid or expired token'
+    });
+  }
+};
 
 // MongoDB Connection
 const connectDB = async () => {
@@ -217,10 +259,17 @@ app.post('/api/users', async (req, res) => {
 
     await user.save();
     
+    // Generate JWT token for new user
+    const token = generateToken(user);
+    
     res.status(201).json({
       success: true,
       message: 'User created successfully',
-      data: user
+      data: {
+        name: user.name,
+        balance: user.balance,
+        token: token
+      }
     });
   } catch (error) {
     if (error.code === 11000) {
@@ -298,9 +347,43 @@ app.post('/api/auth', async (req, res) => {
       });
     }
 
+    // Generate JWT token
+    const token = generateToken(user);
+
     res.json({
       success: true,
       message: 'Authentication successful',
+      data: {
+        name: user.name,
+        balance: user.balance,
+        token: token
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Authentication error',
+      error: error.message
+    });
+  }
+});
+
+// Verify JWT token and get current user
+app.get('/api/auth/verify', authenticateToken, async (req, res) => {
+  try {
+    // Get updated user data from database
+    const user = await User.findById(req.user.id);
+    
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Token is valid',
       data: {
         name: user.name,
         balance: user.balance
@@ -309,7 +392,7 @@ app.post('/api/auth', async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: 'Authentication error',
+      message: 'Token verification error',
       error: error.message
     });
   }
@@ -753,6 +836,160 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle admin kick player
+  socket.on('kickPlayer', async (data) => {
+    try {
+      const { roomId, targetUsername, adminUsername } = data;
+      
+      const room = await GameRoom.findById(roomId);
+      if (!room) {
+        socket.emit('error', { message: 'Room not found' });
+        return;
+      }
+
+      // Check if admin is the room creator (first player)
+      if (room.players.length === 0 || room.players[0].username !== adminUsername.toLowerCase()) {
+        socket.emit('error', { message: 'Only room creator can kick players' });
+        return;
+      }
+
+      // Find and remove the target player
+      const playerIndex = room.players.findIndex(p => p.username === targetUsername.toLowerCase());
+      if (playerIndex === -1) {
+        socket.emit('error', { message: 'Player not found' });
+        return;
+      }
+
+      if (playerIndex === 0) {
+        socket.emit('error', { message: 'Cannot kick the room creator' });
+        return;
+      }
+
+      // Remove player from room
+      const kickedPlayer = room.players[playerIndex];
+      room.players.splice(playerIndex, 1);
+      
+      // Adjust currentPlayerIndex if necessary
+      if (room.currentPlayerIndex >= playerIndex) {
+        room.currentPlayerIndex = Math.max(0, room.currentPlayerIndex - 1);
+      }
+
+      await room.save();
+
+      // Notify all players
+      io.to(roomId).emit('playerKicked', {
+        kickedPlayer: kickedPlayer.username,
+        room: room,
+        message: `${kickedPlayer.username} has been kicked from the room`
+      });
+
+      console.log(`👢 Player ${kickedPlayer.username} kicked from room ${roomId} by ${adminUsername}`);
+    } catch (error) {
+      console.error('Error kicking player:', error);
+      socket.emit('error', { message: 'Failed to kick player' });
+    }
+  });
+
+  // Handle credit request
+  socket.on('requestCredit', async (data) => {
+    try {
+      const { roomId, requesterUsername, amount } = data;
+      
+      const room = await GameRoom.findById(roomId);
+      if (!room) {
+        socket.emit('error', { message: 'Room not found' });
+        return;
+      }
+
+      // Check if requester is in the room
+      const requester = room.players.find(p => p.username === requesterUsername.toLowerCase());
+      if (!requester) {
+        socket.emit('error', { message: 'You are not in this room' });
+        return;
+      }
+
+      // Check if player is bankrupt
+      if (requester.balance > 0) {
+        socket.emit('error', { message: 'You can only request credit when bankrupt' });
+        return;
+      }
+
+      // Notify all other players about the credit request
+      socket.to(roomId).emit('creditRequest', {
+        requester: requesterUsername,
+        amount: amount,
+        roomId: roomId,
+        message: `${requesterUsername} is requesting ₹${amount} credit`
+      });
+
+      console.log(`💰 Credit request: ${requesterUsername} requesting ₹${amount} in room ${roomId}`);
+    } catch (error) {
+      console.error('Error processing credit request:', error);
+      socket.emit('error', { message: 'Failed to request credit' });
+    }
+  });
+
+  // Handle credit response
+  socket.on('respondToCredit', async (data) => {
+    try {
+      const { roomId, donorUsername, requesterUsername, amount, accepted } = data;
+      
+      if (!accepted) {
+        // Credit rejected
+        io.to(roomId).emit('creditRejected', {
+          requester: requesterUsername,
+          donor: donorUsername,
+          message: `${donorUsername} rejected ${requesterUsername}'s credit request`
+        });
+        return;
+      }
+
+      const room = await GameRoom.findById(roomId);
+      if (!room) {
+        socket.emit('error', { message: 'Room not found' });
+        return;
+      }
+
+      // Find donor and requester
+      const donor = room.players.find(p => p.username === donorUsername.toLowerCase());
+      const requester = room.players.find(p => p.username === requesterUsername.toLowerCase());
+
+      if (!donor || !requester) {
+        socket.emit('error', { message: 'Player not found' });
+        return;
+      }
+
+      // Check if donor has enough balance
+      if (donor.balance < amount) {
+        socket.emit('error', { message: 'Insufficient balance to provide credit' });
+        return;
+      }
+
+      // Transfer money
+      donor.balance -= amount;
+      requester.balance += amount;
+
+      // Update database
+      await User.updateOne({ name: donorUsername.toLowerCase() }, { balance: donor.balance });
+      await User.updateOne({ name: requesterUsername.toLowerCase() }, { balance: requester.balance });
+      await room.save();
+
+      // Notify all players
+      io.to(roomId).emit('creditAccepted', {
+        donor: donorUsername,
+        requester: requesterUsername,
+        amount: amount,
+        room: room,
+        message: `${donorUsername} provided ₹${amount} credit to ${requesterUsername}`
+      });
+
+      console.log(`💸 Credit transfer: ${donorUsername} gave ₹${amount} to ${requesterUsername}`);
+    } catch (error) {
+      console.error('Error processing credit response:', error);
+      socket.emit('error', { message: 'Failed to process credit response' });
+    }
+  });
+
   // Handle disconnection
   socket.on('disconnect', () => {
     const userInfo = connectedUsers.get(socket.id);
@@ -843,6 +1080,7 @@ const startServer = async () => {
     console.log(`   POST   /api/users       - Create new user`);
     console.log(`   PUT    /api/users/:name/balance - Update user balance`);
     console.log(`   POST   /api/auth        - Authenticate user`);
+    console.log(`   GET    /api/auth/verify - Verify JWT token`);
     console.log(`   GET    /api/rooms       - Get all rooms`);
     console.log(`   POST   /api/rooms       - Create new room`);
     console.log(`   POST   /api/rooms/:id/join - Join room`);
