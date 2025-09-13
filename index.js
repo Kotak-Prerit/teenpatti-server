@@ -152,6 +152,10 @@ const gameRoomSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  roundNumber: {
+    type: Number,
+    default: 1
+  },
   gameStarted: {
     type: Boolean,
     default: false
@@ -162,8 +166,12 @@ const gameRoomSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['waiting', 'playing', 'finished'],
+    enum: ['waiting', 'playing', 'finished', 'round-ended'],
     default: 'waiting'
+  },
+  lastRoundWinner: {
+    username: String,
+    amount: Number
   },
   winner: {
     username: String,
@@ -644,6 +652,7 @@ app.delete('/api/rooms/:roomId', async (req, res) => {
 
 // Socket.IO Connection Handling
 const connectedUsers = new Map(); // Map socketId to username
+const creditRequests = new Map(); // Map roomId to active credit requests
 
 io.on('connection', (socket) => {
   console.log(`🔌 User connected: ${socket.id}`);
@@ -787,27 +796,48 @@ io.on('connection', (socket) => {
           // Check if only one player remaining
           const activePlayers = room.players.filter(p => p.isActive && !p.hasPacked);
           if (activePlayers.length === 1) {
-            // Game ends
+            // Round ends
             const winner = activePlayers[0];
-            winner.balance += room.pot;
+            const winAmount = room.pot;
+            winner.balance += winAmount;
             
             // Update winner's balance in database
             await User.findOneAndUpdate(
               { name: winner.username },
-              { $inc: { balance: room.pot } }
+              { $inc: { balance: winAmount } }
             );
+
+            // Update all players' balances in the room
+            for (let player of room.players) {
+              const user = await User.findOne({ name: player.username });
+              if (user) {
+                player.balance = user.balance;
+              }
+            }
             
-            room.winner = {
+            room.lastRoundWinner = {
               username: winner.username,
-              amount: room.pot
+              amount: winAmount
             };
             room.roundActive = false;
-            room.status = 'finished';
+            room.status = 'round-ended';
+            room.pot = 0; // Reset pot for next round
+            room.roundNumber += 1;
             
-            io.to(roomId).emit('gameEnded', {
+            // Reset player states for next round
+            room.players.forEach(player => {
+              player.hasPacked = false;
+              player.isActive = true;
+            });
+            
+            // Randomize starting player for next round
+            room.currentPlayerIndex = Math.floor(Math.random() * room.players.length);
+            
+            io.to(roomId).emit('roundEnded', {
               room: room,
               winner: winner.username,
-              amount: room.pot
+              amount: winAmount,
+              roundNumber: room.roundNumber - 1
             });
             
             await room.save();
@@ -914,6 +944,32 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // Check amount limit
+      if (amount > 5000) {
+        socket.emit('error', { message: 'Maximum credit request is ₹5000' });
+        return;
+      }
+
+      // Get other players who can provide credit
+      const otherPlayers = room.players.filter(p => 
+        p.username !== requesterUsername.toLowerCase() && p.balance >= amount
+      );
+
+      if (otherPlayers.length === 0) {
+        socket.emit('error', { message: 'No players have sufficient balance to provide credit' });
+        return;
+      }
+
+      // Store credit request with tracking
+      creditRequests.set(roomId, {
+        requester: requesterUsername,
+        amount: amount,
+        eligiblePlayers: otherPlayers.map(p => p.username),
+        rejectedBy: [],
+        acceptedBy: null,
+        timestamp: Date.now()
+      });
+
       // Notify all other players about the credit request
       socket.to(roomId).emit('creditRequest', {
         requester: requesterUsername,
@@ -934,8 +990,58 @@ io.on('connection', (socket) => {
     try {
       const { roomId, donorUsername, requesterUsername, amount, accepted } = data;
       
+      const room = await GameRoom.findById(roomId);
+      if (!room) {
+        socket.emit('error', { message: 'Room not found' });
+        return;
+      }
+
+      const creditRequest = creditRequests.get(roomId);
+      if (!creditRequest || creditRequest.requester !== requesterUsername) {
+        socket.emit('error', { message: 'No active credit request found' });
+        return;
+      }
+
       if (!accepted) {
-        // Credit rejected
+        // Credit rejected - add to rejection list
+        if (!creditRequest.rejectedBy.includes(donorUsername.toLowerCase())) {
+          creditRequest.rejectedBy.push(donorUsername.toLowerCase());
+        }
+
+        // Check if all eligible players have rejected
+        const allRejected = creditRequest.eligiblePlayers.every(player => 
+          creditRequest.rejectedBy.includes(player.toLowerCase())
+        );
+
+        if (allRejected) {
+          // Remove bankrupt player from game
+          const requesterIndex = room.players.findIndex(p => p.username === requesterUsername.toLowerCase());
+          if (requesterIndex !== -1) {
+            room.players.splice(requesterIndex, 1);
+            
+            // Adjust currentPlayerIndex if necessary
+            if (room.currentPlayerIndex >= requesterIndex) {
+              room.currentPlayerIndex = Math.max(0, room.currentPlayerIndex - 1);
+            }
+
+            await room.save();
+
+            // Clear the credit request
+            creditRequests.delete(roomId);
+
+            // Notify all players
+            io.to(roomId).emit('playerRemovedBankrupt', {
+              removedPlayer: requesterUsername,
+              room: room,
+              message: `${requesterUsername} has been removed from the game due to bankruptcy`
+            });
+
+            console.log(`❌ Player ${requesterUsername} removed from room ${roomId} due to bankruptcy`);
+            return;
+          }
+        }
+
+        // Credit rejected but not all players have rejected yet
         io.to(roomId).emit('creditRejected', {
           requester: requesterUsername,
           donor: donorUsername,
@@ -944,12 +1050,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const room = await GameRoom.findById(roomId);
-      if (!room) {
-        socket.emit('error', { message: 'Room not found' });
-        return;
-      }
-
+      // Credit accepted
       // Find donor and requester
       const donor = room.players.find(p => p.username === donorUsername.toLowerCase());
       const requester = room.players.find(p => p.username === requesterUsername.toLowerCase());
@@ -974,6 +1075,9 @@ io.on('connection', (socket) => {
       await User.updateOne({ name: requesterUsername.toLowerCase() }, { balance: requester.balance });
       await room.save();
 
+      // Clear the credit request
+      creditRequests.delete(roomId);
+
       // Notify all players
       io.to(roomId).emit('creditAccepted', {
         donor: donorUsername,
@@ -987,6 +1091,107 @@ io.on('connection', (socket) => {
     } catch (error) {
       console.error('Error processing credit response:', error);
       socket.emit('error', { message: 'Failed to process credit response' });
+    }
+  });
+
+  // Handle start next round
+  socket.on('startNextRound', async (data) => {
+    try {
+      const { roomId, username } = data;
+      const room = await GameRoom.findById(roomId);
+      
+      if (!room || room.status !== 'round-ended') {
+        socket.emit('error', { message: 'Cannot start next round' });
+        return;
+      }
+
+      // Check if user is in room
+      const player = room.players.find(p => p.username === username);
+      if (!player) {
+        socket.emit('error', { message: 'Not authorized to start next round' });
+        return;
+      }
+
+      // Check for bankrupt players (balance <= 0)
+      const bankruptPlayers = room.players.filter(p => p.balance <= 0);
+      const activePlayers = room.players.filter(p => p.balance > 0);
+
+      // If only one player has money left, end the game
+      if (activePlayers.length <= 1) {
+        if (activePlayers.length === 1) {
+          room.winner = {
+            username: activePlayers[0].username,
+            amount: activePlayers[0].balance
+          };
+        }
+        room.status = 'finished';
+        room.roundActive = false;
+        await room.save();
+
+        io.to(roomId).emit('gameEnded', {
+          room: room,
+          winner: room.winner?.username || 'No winner',
+          amount: room.winner?.amount || 0
+        });
+        return;
+      }
+
+      // Remove bankrupt players from the game who couldn't get credit
+      room.players = room.players.filter(p => p.balance > 0);
+
+      // Check if enough players remain
+      if (room.players.length < 2) {
+        if (room.players.length === 1) {
+          room.winner = {
+            username: room.players[0].username,
+            amount: room.players[0].balance
+          };
+        }
+        room.status = 'finished';
+        room.roundActive = false;
+        await room.save();
+
+        io.to(roomId).emit('gameEnded', {
+          room: room,
+          winner: room.winner?.username || 'No winner',
+          amount: room.winner?.amount || 0
+        });
+        return;
+      }
+
+      // Deduct entry fee from all remaining players
+      for (let player of room.players) {
+        if (player.balance >= room.entryFee) {
+          player.balance -= room.entryFee;
+          room.pot += room.entryFee;
+          
+          // Update user balance in database
+          await User.findOneAndUpdate(
+            { name: player.username },
+            { $inc: { balance: -room.entryFee } }
+          );
+        } else {
+          // If player can't afford entry fee, they become bankrupt
+          player.balance = 0;
+        }
+      }
+
+      // Start the next round
+      room.roundActive = true;
+      room.status = 'playing';
+      room.currentPlayerIndex = Math.floor(Math.random() * room.players.length);
+      room.lastActivity = new Date();
+      room.lastRoundWinner = undefined; // Clear previous round winner
+      
+      await room.save();
+
+      // Notify all players
+      io.to(roomId).emit('gameStarted', room);
+      
+      console.log(`🎮 Next round started in room ${roomId}`);
+    } catch (error) {
+      console.error('Error starting next round:', error);
+      socket.emit('error', { message: 'Failed to start next round' });
     }
   });
 
