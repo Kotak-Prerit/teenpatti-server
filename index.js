@@ -736,23 +736,29 @@ function getNextActivePlayer(room, currentIndex) {
 // Function to seed dummy users
 const seedUsers = async () => {
   try {
-    const existingUsers = await User.countDocuments();
-    if (existingUsers > 0) {
-      console.log('📚 Users already exist in database');
-      return;
-    }
-
     const dummyUsers = [
-      { name: 'mark', pin: Math.floor(1000 + Math.random() * 9000).toString(), balance: 20000 },
-      { name: 'shubham', pin: Math.floor(1000 + Math.random() * 9000).toString(), balance: 20000 },
-      { name: 'prerit', pin: Math.floor(1000 + Math.random() * 9000).toString(), balance: 20000 }
+      { name: 'mark', pin: '1234', balance: 20000 },
+      { name: 'shubham', pin: '5678', balance: 20000 },
+      { name: 'prerit', pin: '5414', balance: 20000 }
     ];
 
-    await User.insertMany(dummyUsers);
-    console.log('🌱 Dummy users seeded successfully:');
-    dummyUsers.forEach(user => {
-      console.log(`   ${user.name}: PIN ${user.pin}, Balance ₹${user.balance}`);
-    });
+    for (const userData of dummyUsers) {
+      const existingUser = await User.findOne({ name: userData.name });
+      if (existingUser) {
+        // Update existing user's PIN and balance
+        await User.updateOne(
+          { name: userData.name },
+          { pin: userData.pin, balance: userData.balance }
+        );
+        console.log(`🔄 Updated user: ${userData.name} (PIN: ${userData.pin})`);
+      } else {
+        // Create new user
+        await User.create(userData);
+        console.log(`🌱 Created user: ${userData.name} (PIN: ${userData.pin})`);
+      }
+    }
+    
+    console.log('✅ Dummy users setup completed');
   } catch (error) {
     console.error('❌ Error seeding users:', error.message);
   }
