@@ -98,12 +98,6 @@ const gameRoomSchema = new mongoose.Schema({
     hasPacked: { type: Boolean, default: false },
     socketId: String
   }],
-  maxPlayers: {
-    type: Number,
-    default: 3,
-    min: 2,
-    max: 6
-  },
   entryFee: {
     type: Number,
     default: 500
@@ -347,7 +341,7 @@ app.get('/api/rooms', async (req, res) => {
 // Create new room
 app.post('/api/rooms', async (req, res) => {
   try {
-    const { name, maxPlayers = 3, entryFee = 500, creatorUsername } = req.body;
+    const { name, entryFee = 500, creatorUsername } = req.body;
     
     if (!name || !creatorUsername) {
       return res.status(400).json({
@@ -374,7 +368,6 @@ app.post('/api/rooms', async (req, res) => {
 
     const room = new GameRoom({
       name: name.trim(),
-      maxPlayers: Math.min(Math.max(maxPlayers, 2), 6),
       entryFee,
       players: [{
         username: user.name,
@@ -425,13 +418,6 @@ app.post('/api/rooms/:roomId/join', async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'Cannot join room - game already started'
-      });
-    }
-
-    if (room.players.length >= room.maxPlayers) {
-      return res.status(400).json({
-        success: false,
-        message: 'Room is full'
       });
     }
 
@@ -509,6 +495,65 @@ app.get('/api/rooms/:roomId', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error fetching room',
+      error: error.message
+    });
+  }
+});
+
+// Delete room
+app.delete('/api/rooms/:roomId', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { username } = req.body;
+    
+    if (!username) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username is required to delete room'
+      });
+    }
+
+    const room = await GameRoom.findById(roomId);
+    if (!room) {
+      return res.status(404).json({
+        success: false,
+        message: 'Room not found'
+      });
+    }
+
+    // Check if the user is the creator (first player) of the room
+    if (room.players.length === 0 || room.players[0].username !== username.toLowerCase()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only the room creator can delete the room'
+      });
+    }
+
+    // If game is in progress, don't allow deletion
+    if (room.gameStarted || room.status === 'playing') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete room while game is in progress'
+      });
+    }
+
+    // Notify all players in the room that it's being deleted
+    io.to(roomId).emit('roomDeleted', {
+      message: 'Room has been deleted by the creator',
+      roomId: roomId
+    });
+
+    // Delete the room
+    await GameRoom.findByIdAndDelete(roomId);
+
+    res.json({
+      success: true,
+      message: 'Room deleted successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting room',
       error: error.message
     });
   }
@@ -802,6 +847,7 @@ const startServer = async () => {
     console.log(`   POST   /api/rooms       - Create new room`);
     console.log(`   POST   /api/rooms/:id/join - Join room`);
     console.log(`   GET    /api/rooms/:id   - Get room details`);
+    console.log(`   DELETE /api/rooms/:id   - Delete room (creator only)`);
   });
 };
 
